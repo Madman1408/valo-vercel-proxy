@@ -1,18 +1,18 @@
 // =============================================================================
 // VALORANT API PROXY FOR VERCEL (Node.js Serverless)
-// Полная совместимость со Streamer.bot + кэширование + защита от 429/503
+// Кэширование + защита от 429/503 + поддержка кастомных шаблонов чата
 // =============================================================================
 
 const cache = new Map();
 const inFlight = new Map();
 
 const TTL = {
-  mmr: 50_000,       // 50 сек — текущий ранг, RR, ELO
-  history: 50_000,   // 50 сек — история изменений RR
-  matches: 55_000,   // 55 сек — матчи (общий кэш для всех команд)
-  stored: 55_000,    // 55 сек — легкая история матчей для !rank
-  season: 120_000,   // 2 мин — статистика текущего акта
-  account: 300_000   // 5 мин — уровень аккаунта
+  mmr: 50_000,
+  history: 50_000,
+  matches: 55_000,
+  stored: 55_000,
+  season: 120_000,
+  account: 300_000
 };
 
 const FETCH_TIMEOUT_MS = 8500;
@@ -34,7 +34,6 @@ export default async function handler(req, res) {
 
   const action = (q.get("action") || "widget").toLowerCase();
 
-  // Легкий пинг для проверки работоспособности прокси в браузере
   if (action === "ping") {
     return res.status(200).json({
       status: "ok",
@@ -49,6 +48,8 @@ export default async function handler(req, res) {
   const tag = (q.get("tag") || "").trim();
   const apiKey = (q.get("key") || "").trim();
   const displayUser = q.get("displayUser") || "@Зритель";
+  const chatTpl = (q.get("chatTpl") || "").trim();
+  const chatTpl2 = (q.get("chatTpl2") || "").trim();
 
   if (!name || !tag || !apiKey) {
     return res.status(200).json({
@@ -60,7 +61,7 @@ export default async function handler(req, res) {
 
   const headers = {
     "Authorization": apiKey,
-    "User-Agent": "VercelProxy-StreamerBot/3.0"
+    "User-Agent": "VercelProxy-StreamerBot/3.1"
   };
 
   const encName = encodeURIComponent(name);
@@ -69,7 +70,7 @@ export default async function handler(req, res) {
 
   try {
     // =========================================================================
-    // 1. ГЛАВНЫЙ ВИДЖЕТ СТРИМА (action=widget) — СТРОГО ПОСЛЕ ВРЕМЕНИ СБРОСА
+    // 1. ГЛАВНЫЙ ВИДЖЕТ СТРИМА (action=widget)
     // =========================================================================
     if (action === "widget") {
       const resetTime = parseInt(q.get("resetTime") || "0", 10);
@@ -94,16 +95,13 @@ export default async function handler(req, res) {
       const rrChanges = {};
       const histArr = histRes.ok && Array.isArray(histRes.data?.data) ? histRes.data.data : [];
       for (const m of histArr) {
-        if (m.match_id) {
-          rrChanges[m.match_id] = m.mmr_change_to_last_game ?? 0;
-        }
+        if (m.match_id) rrChanges[m.match_id] = m.mmr_change_to_last_game ?? 0;
       }
 
       let w = 0, l = 0, netRR = 0;
       let totalK = 0, totalD = 0, totalHS = 0, totalBS = 0, totalLS = 0;
       const streamAgents = [];
 
-      // Умная проверка: если resetTime задан, а последняя игра в истории была >2 часов ДО сброса — не качаем 5 МБ матчей
       const newestHistTime = histArr.length > 0 ? (histArr[0]?.date_raw ?? 0) : 0;
       const definitelyNoGamesSinceReset = newestHistTime > 0 && newestHistTime < (resetTime - 7200);
 
@@ -152,23 +150,14 @@ export default async function handler(req, res) {
 
       return res.status(200).json({
         status: "ok",
-        name,
-        tag,
+        name, tag,
         rank: rankName,
-        tierId,
-        rr,
-        elo,
+        tierId, rr, elo,
         lastChange: lastChange >= 0 ? `+${lastChange}` : `${lastChange}`,
-        peakRank,
-        peakEp,
-        w,
-        l,
-        totalGames,
-        wr,
-        netRR,
-        netRRStr,
-        kd,
-        hs: hsPercent,
+        peakRank, peakEp,
+        w, l, totalGames, wr,
+        netRR, netRRStr,
+        kd, hs: hsPercent,
         agents: streamAgents,
         agentsCsv: streamAgents.join(",")
       });
@@ -253,17 +242,9 @@ export default async function handler(req, res) {
         chatMatchDetails.push(`${matchIcon}${mvpIcon} ${mapName} ${myScore}:${enemyScore} (${gameRRStr})`);
 
         matchesJson.push({
-          map: mapName,
-          agent: aName,
-          result: resultStr,
-          myScore,
-          enemyScore,
-          k,
-          d,
-          a,
-          rr: gameRRStr,
-          isMatchMVP,
-          isTeamMVP
+          map: mapName, agent: aName, result: resultStr,
+          myScore, enemyScore, k, d, a, rr: gameRRStr,
+          isMatchMVP, isTeamMVP
         });
       }
 
@@ -274,23 +255,30 @@ export default async function handler(req, res) {
         return res.status(200).json({ status: "empty", chatMsg: emptyMsg, refund: true });
       }
 
-      const rrSign = totalRR > 0 ? "+" : "";
+      const totalRRStr = `${totalRR > 0 ? "+" : ""}${totalRR}`;
       const chatTitle = isDay ? "ЗА 24 ЧАСА" : "ПОСЛЕДНИЕ 10 ИГР";
       const overlayTitle = isDay ? "ИТОГИ ЗА 24 ЧАСА" : "ПОСЛЕДНИЕ 10 ИГР";
-      let finalChatMsg = `${displayUser}, 📊 ${chatTitle} (${name}#${tag}): ${totalW}W-${totalL}L | Общее RR: ${rrSign}${totalRR} 📈 | ${chatMatchDetails.join(" 🔹 ")}`;
-      if (finalChatMsg.length > 490) finalChatMsg = finalChatMsg.substring(0, 485) + "...";
+      const matchesStr = chatMatchDetails.join(" 🔹 ");
+
+      const defaultMsg = `${displayUser}, 📊 ${chatTitle} (${name}#${tag}): ${totalW}W-${totalL}L | Общее RR: ${totalRRStr} 📈 | ${matchesStr}`;
+      const finalChatMsg = renderChatTpl(chatTpl, {
+        user: displayUser,
+        name, tag,
+        w: totalW,
+        l: totalL,
+        draw: totalDraw,
+        games: matchesJson.length,
+        totalRR: totalRRStr,
+        matches: matchesStr
+      }, defaultMsg);
 
       return res.status(200).json({
         status: "ok",
         chatMsg: finalChatMsg,
         overlayData: {
-          name,
-          tag,
-          iconMode,
+          name, tag, iconMode,
           title: overlayTitle,
-          w: totalW,
-          l: totalL,
-          totalRR,
+          w: totalW, l: totalL, totalRR,
           gamesCount: matchesJson.length,
           matches: matchesJson
         }
@@ -401,7 +389,22 @@ export default async function handler(req, res) {
       const wr = (w + l) === 0 ? 0 : Math.round((w / (w + l)) * 100);
       const recentStr = recentAgentsList.join(",");
 
-      const chatMsg = `${displayUser}, 📋 ДОСЬЕ ${name}#${tag} (За ${games} игр): 🏆 ${rankName} (${rr} RR) (Итог: ${changeStr} RR) | 🎮 ${w}W-${l}L (${wr}%). 🎯 K/D: ${kd} | HS: ${hsP}%. 🩸 FB/FD: ${fb}/${fd}. 🔫 Мейн: ${bestAgentName}`;
+      const defaultMsg = `${displayUser}, 📋 ДОСЬЕ ${name}#${tag} (За ${games} игр): 🏆 ${rankName} (${rr} RR) (Итог: ${changeStr} RR) | 🎮 ${w}W-${l}L (${wr}%). 🎯 K/D: ${kd} | HS: ${hsP}%. 🩸 FB/FD: ${fb}/${fd}. 🔫 Мейн: ${bestAgentName}`;
+      const chatMsg = renderChatTpl(chatTpl, {
+        user: displayUser,
+        name, tag, games,
+        rank: rankName, rr,
+        change: changeStr, elo,
+        peak: peakRank, peakEp,
+        lvl: accLevel,
+        w, l, wr, kd,
+        hs: hsP, adr,
+        fb, fd,
+        maxk: maxKills,
+        agent: bestAgentName,
+        ace, "4k": quad, "3k": triple, "2k": doubleKill
+      }, defaultMsg);
+
       const urlArgs = `?name=${encName}&tag=${encTag}&mainIcon=${mainIcon}&recentIcon=${recentIcon}&lvl=${accLevel}&rank=${encodeURIComponent(rankName)}&rr=${rr}&change=${encodeURIComponent(changeStr)}&elo=${elo}&peak=${encodeURIComponent(peakRank)}&peakEp=${encodeURIComponent(peakEp)}&w=${w}&l=${l}&wr=${wr}&games=${games}&agentName=${encodeURIComponent(bestAgentName)}&recent=${encodeURIComponent(recentStr)}&kd=${kd}&hs=${hsP}&adr=${adr}&fb=${fb}&fd=${fd}&maxk=${maxKills}&ace=${ace}&4k=${quad}&3k=${triple}&2k=${doubleKill}`;
 
       return res.status(200).json({ status: "ok", chatMsg, urlArgs });
@@ -488,9 +491,25 @@ export default async function handler(req, res) {
 
       const rrString = rrChange >= 0 ? `+${rrChange}` : `${rrChange}`;
       const chatMatchResult = matchResult === "ПОБЕДА" ? "🟢 ПОБЕДА" : (matchResult === "ПОРАЖЕНИЕ" ? "🔴 ПОРАЖЕНИЕ" : "⚪ НИЧЬЯ");
-      const mvpChatIcon = isMatchMVP ? "👑 " : (isTeamMVP ? "🏅 " : "");
+      const mvpChatIcon = isMatchMVP ? "👑" : (isTeamMVP ? "🏅" : "");
+      const scoreColon = `${myScore}:${enemyScore}`;
 
-      const chatMsg = `${displayUser}, ${mvpChatIcon}${name}#${tag} | ${chatMatchResult} на ${mapName} (${myScore}:${enemyScore}). 🔫 ${agentName}: ${k}/${d}/${a} (K/D ${kd}). 🎯 HS: ${hsP}%. 📈 Итог: ${rrString} RR.`;
+      const defaultMsg = `${displayUser}, ${mvpChatIcon ? mvpChatIcon + " " : ""}${name}#${tag} | ${chatMatchResult} на ${mapName} (${scoreColon}). 🔫 ${agentName}: ${k}/${d}/${a} (K/D ${kd}). 🎯 HS: ${hsP}%. 📈 Итог: ${rrString} RR.`;
+      const chatMsg = renderChatTpl(chatTpl, {
+        user: displayUser,
+        name, tag,
+        mvp: mvpChatIcon,
+        result: chatMatchResult,
+        map: mapName,
+        score: scoreColon,
+        agent: agentName,
+        k, d, a, kd,
+        hs: hsP, bs: bsP, ls: lsP,
+        adr, rr: rrString,
+        fb, fd,
+        ace, "4k": quad, "3k": triple, "2k": doubleKill
+      }, defaultMsg);
+
       const urlArgs = `?name=${encName}&tag=${encTag}&iconMode=${iconMode}&agent=${encodeURIComponent(agentName)}&map=${encodeURIComponent(mapName)}&result=${encodeURIComponent(matchResult)}&score=${myScore}-${enemyScore}&k=${k}&d=${d}&a=${a}&rr=${encodeURIComponent(rrString)}&kd=${kd}&hs=${hsP}&bs=${bsP}&ls=${lsP}&adr=${adr}&fb=${fb}&fd=${fd}&maxk=${k}&ace=${ace}&4k=${quad}&3k=${triple}&2k=${doubleKill}&isMatchMVP=${isMatchMVP}&isTeamMVP=${isTeamMVP}`;
 
       return res.status(200).json({ status: "ok", chatMsg, urlArgs });
@@ -558,15 +577,8 @@ export default async function handler(req, res) {
         const kdRatio = d === 0 ? k.toFixed(2) : (k / d).toFixed(2);
 
         const pObj = {
-          name: pName,
-          tag: pTag,
-          agent,
-          rank,
-          k,
-          d,
-          a,
-          kd: kdRatio,
-          score,
+          name: pName, tag: pTag, agent, rank,
+          k, d, a, kd: kdRatio, score,
           isStreamer: pName.toLowerCase() === name.toLowerCase() && pTag.toLowerCase() === tag.toLowerCase()
         };
 
@@ -577,14 +589,26 @@ export default async function handler(req, res) {
       myTeamArr.sort((a, b) => b.score - a.score);
       enemyTeamArr.sort((a, b) => b.score - a.score);
 
-      const myTeamChatList = myTeamArr.map(p => `${p.name}#${p.tag} [${p.agent}]: ${p.k}/${p.d}/${p.a}`);
-      const enemyTeamChatList = enemyTeamArr.map(p => `${p.name}#${p.tag} [${p.agent}]: ${p.k}/${p.d}/${p.a}`);
+      const myTeamStr = myTeamArr.map(p => `${p.name}#${p.tag} [${p.agent}]: ${p.k}/${p.d}/${p.a}`).join(" | ");
+      const enemyTeamStr = enemyTeamArr.map(p => `${p.name}#${p.tag} [${p.agent}]: ${p.k}/${p.d}/${p.a}`).join(" | ");
+      const scoreDash = `${myScore}-${enemyScore}`;
 
-      let myTeamMsg = `${displayUser}, 🟢 ${teamTitle} (${mapName} ${chatResultIcon} ${myScore}-${enemyScore}): ` + myTeamChatList.join(" | ");
-      if (myTeamMsg.length > 490) myTeamMsg = myTeamMsg.substring(0, 485) + "...";
+      const defaultTeam1 = `${displayUser}, 🟢 ${teamTitle} (${mapName} ${chatResultIcon} ${scoreDash}): ${myTeamStr}`;
+      const defaultTeam2 = `🔴 Соперники: ${enemyTeamStr}`;
 
-      let enemyTeamMsg = `🔴 Соперники: ` + enemyTeamChatList.join(" | ");
-      if (enemyTeamMsg.length > 490) enemyTeamMsg = enemyTeamMsg.substring(0, 485) + "...";
+      const scoreVars = {
+        user: displayUser,
+        name, tag,
+        teamTitle,
+        map: mapName,
+        resultIcon: chatResultIcon,
+        score: scoreDash,
+        myTeam: myTeamStr,
+        enemyTeam: enemyTeamStr
+      };
+
+      const myTeamMsg = renderChatTpl(chatTpl, scoreVars, defaultTeam1);
+      const enemyTeamMsg = renderChatTpl(chatTpl2, scoreVars, defaultTeam2);
 
       return res.status(200).json({
         status: "ok",
@@ -592,11 +616,9 @@ export default async function handler(req, res) {
         enemyTeamMsg,
         overlayData: {
           streamer: streamerName,
-          map: mapName,
-          mode,
+          map: mapName, mode,
           result: resultStr,
-          myScore,
-          enemyScore,
+          myScore, enemyScore,
           myTeam: myTeamArr,
           enemyTeam: enemyTeamArr,
           iconMode
@@ -605,7 +627,7 @@ export default async function handler(req, res) {
     }
 
     // =========================================================================
-    // 7. RANK CHECK (action=rank) — ЛЕГКИЙ ЭНДПОИНТ ДЛЯ ТОП-АГЕНТА
+    // 7. RANK CHECK (action=rank)
     // =========================================================================
     if (action === "rank") {
       const iconMode = q.get("iconMode") || "alt";
@@ -639,8 +661,21 @@ export default async function handler(req, res) {
         return res.status(200).json({ status: "empty", chatMsg: `${displayUser}, 😴 ${name}#${tag} без ранга. Ждем камбека!`, refund: true });
       }
 
+      const agentDisplay = bestAgentName !== "Unknown" ? bestAgentName : "Скрыт 🥷";
       const agentText = bestAgentName !== "Unknown" ? `Мейн: ${bestAgentName} 🔫` : "Мейн: Скрыт 🥷";
-      const chatMsg = `${displayUser}, 🔥 ${name}#${tag} ➔ Текущий: ${rankName} (${rr} RR) | Пик: ${peakRank} 👑 | ${agentText}`;
+      const defaultMsg = `${displayUser}, 🔥 ${name}#${tag} ➔ Текущий: ${rankName} (${rr} RR) | Пик: ${peakRank} 👑 | ${agentText}`;
+
+      const chatMsg = renderChatTpl(chatTpl, {
+        user: displayUser,
+        name, tag,
+        rank: rankName, rr,
+        change: changeStr, elo,
+        peak: peakRank, peakEp,
+        lvl: accLevel,
+        agent: agentDisplay,
+        games
+      }, defaultMsg);
+
       const urlArgs = `?name=${encName}&tag=${encTag}&iconMode=${iconMode}&lvl=${accLevel}&rank=${encodeURIComponent(rankName)}&rr=${rr}&change=${encodeURIComponent(changeStr)}&elo=${elo}&peak=${encodeURIComponent(peakRank)}&peakEp=${encodeURIComponent(peakEp)}&games=${games}&agentName=${encodeURIComponent(bestAgentName)}`;
 
       return res.status(200).json({ status: "ok", chatMsg, urlArgs });
@@ -688,14 +723,23 @@ export default async function handler(req, res) {
       const formattedAct = latestActKey.toUpperCase();
       const matchWord = getMatchWord(totalGames);
 
-      const finalChatMsg = `${displayUser}, 📊 (${name}#${tag}) ${formattedAct}: ${totalGames} ${matchWord} (${wins}W-${losses}L, ${globalWr}% WINRATE).`;
+      const defaultMsg = `${displayUser}, 📊 (${name}#${tag}) ${formattedAct}: ${totalGames} ${matchWord} (${wins}W-${losses}L, ${globalWr}% WINRATE).`;
+      const finalChatMsg = renderChatTpl(chatTpl, {
+        user: displayUser,
+        name, tag,
+        act: formattedAct,
+        games: totalGames,
+        matchWord,
+        w: wins,
+        l: losses,
+        wr: globalWr
+      }, defaultMsg);
 
       return res.status(200).json({
         status: "ok",
         chatMsg: finalChatMsg,
         overlayData: {
-          name,
-          tag,
+          name, tag,
           act: formattedAct,
           totalGames,
           totalW: wins,
@@ -717,9 +761,20 @@ export default async function handler(req, res) {
 }
 
 // =============================================================================
+// ШАБЛОНИЗАТОР СООБЩЕНИЙ ЧАТА
+// =============================================================================
+function renderChatTpl(tpl, vars, fallback, maxLen = 490) {
+  let out = (tpl && tpl.trim())
+    ? tpl.replace(/\{([a-zA-Z0-9_]+)\}/g, (match, key) => (vars[key] !== undefined ? String(vars[key]) : match))
+    : fallback;
+  out = out.replace(/\s{2,}/g, " ").trim();
+  if (out.length > maxLen) out = out.substring(0, maxLen - 5) + "...";
+  return out;
+}
+
+// =============================================================================
 // КЭШИРУЮЩИЙ СЛОЙ ДЛЯ HENRIKDEV API
 // =============================================================================
-
 function getCached(key) {
   const entry = cache.get(key);
   if (!entry) return null;
@@ -742,9 +797,7 @@ async function fetchJsonCached(cacheKey, url, headers, ttlMs) {
   const hit = getCached(cacheKey);
   if (hit) return hit;
 
-  if (inFlight.has(cacheKey)) {
-    return inFlight.get(cacheKey);
-  }
+  if (inFlight.has(cacheKey)) return inFlight.get(cacheKey);
 
   const p = (async () => {
     try {
@@ -752,9 +805,7 @@ async function fetchJsonCached(cacheKey, url, headers, ttlMs) {
         headers,
         signal: AbortSignal.timeout(FETCH_TIMEOUT_MS)
       });
-      if (!resp.ok) {
-        return { ok: false, status: resp.status, data: null };
-      }
+      if (!resp.ok) return { ok: false, status: resp.status, data: null };
       const data = await resp.json();
       const result = { ok: true, status: resp.status, data };
       setCached(cacheKey, result, ttlMs);
@@ -771,43 +822,19 @@ async function fetchJsonCached(cacheKey, url, headers, ttlMs) {
 }
 
 function getAccount(playerKey, encName, encTag, headers) {
-  return fetchJsonCached(
-    `acc:${playerKey}`,
-    `https://api.henrikdev.xyz/valorant/v1/account/${encName}/${encTag}`,
-    headers,
-    TTL.account
-  );
+  return fetchJsonCached(`acc:${playerKey}`, `https://api.henrikdev.xyz/valorant/v1/account/${encName}/${encTag}`, headers, TTL.account);
 }
-
 function getMmrV3(playerKey, region, encName, encTag, headers) {
-  return fetchJsonCached(
-    `mmrv3:${playerKey}`,
-    `https://api.henrikdev.xyz/valorant/v3/mmr/${region}/pc/${encName}/${encTag}`,
-    headers,
-    TTL.mmr
-  );
+  return fetchJsonCached(`mmrv3:${playerKey}`, `https://api.henrikdev.xyz/valorant/v3/mmr/${region}/pc/${encName}/${encTag}`, headers, TTL.mmr);
 }
-
 function getMmrV2(playerKey, region, encName, encTag, headers) {
-  return fetchJsonCached(
-    `mmrv2:${playerKey}`,
-    `https://api.henrikdev.xyz/valorant/v2/mmr/${region}/${encName}/${encTag}`,
-    headers,
-    TTL.season
-  );
+  return fetchJsonCached(`mmrv2:${playerKey}`, `https://api.henrikdev.xyz/valorant/v2/mmr/${region}/${encName}/${encTag}`, headers, TTL.season);
 }
-
 function getMmrHistory(playerKey, region, encName, encTag, headers) {
-  return fetchJsonCached(
-    `hist:${playerKey}`,
-    `https://api.henrikdev.xyz/valorant/v1/mmr-history/${region}/${encName}/${encTag}`,
-    headers,
-    TTL.history
-  );
+  return fetchJsonCached(`hist:${playerKey}`, `https://api.henrikdev.xyz/valorant/v1/mmr-history/${region}/${encName}/${encTag}`, headers, TTL.history);
 }
 
 async function getMatches(playerKey, region, encName, encTag, neededSize, headers) {
-  // Если в кэше уже лежат 10 матчей — отдаем срез мгновенно без запроса к API
   const fullHit = getCached(`matches10:${playerKey}`);
   if (fullHit && fullHit.ok && Array.isArray(fullHit.data)) {
     return { ok: true, data: fullHit.data.slice(0, neededSize) };
@@ -829,13 +856,11 @@ async function getMatches(playerKey, region, encName, encTag, neededSize, header
 }
 
 async function getTopAgentFast(playerKey, region, name, tag, encName, encTag, headers) {
-  // 1. Сначала пробуем готовый кэш матчей
   const fullHit = getCached(`matches10:${playerKey}`);
   if (fullHit && fullHit.ok && Array.isArray(fullHit.data) && fullHit.data.length > 0) {
     return extractTopAgentFromV3(fullHit.data, name, tag);
   }
 
-  // 2. Легкий эндпоинт stored-matches (~15 КБ вместо 4 МБ)
   const storedRes = await fetchJsonCached(
     `stored:${playerKey}`,
     `https://api.henrikdev.xyz/valorant/v1/stored-matches/${region}/${encName}/${encTag}?mode=competitive&size=10`,
@@ -858,7 +883,6 @@ async function getTopAgentFast(playerKey, region, name, tag, encName, encTag, he
     return { games, bestAgentName: pickTopAgent(agentPlays) };
   }
 
-  // 3. Фолбэк на v3/matches, если stored-matches пустой или недоступен
   const matchRes = await getMatches(playerKey, region, encName, encTag, 10, headers);
   if (matchRes.ok && Array.isArray(matchRes.data)) {
     return extractTopAgentFromV3(matchRes.data, name, tag);
@@ -870,7 +894,6 @@ async function getTopAgentFast(playerKey, region, name, tag, encName, encTag, he
 // =============================================================================
 // ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
 // =============================================================================
-
 function normalizeAgent(charName) {
   if (!charName) return "Unknown";
   return charName.toUpperCase() === "KAY/O" ? "KAYO" : charName;
@@ -913,9 +936,7 @@ function findPlayer(players, name, tag, puuid = "") {
   const tLow = tag.toLowerCase();
   for (const p of players) {
     if (puuid && p.puuid === puuid) return p;
-    if ((p.name || "").toLowerCase() === nLow && (!tLow || (p.tag || "").toLowerCase() === tLow)) {
-      return p;
-    }
+    if ((p.name || "").toLowerCase() === nLow && (!tLow || (p.tag || "").toLowerCase() === tLow)) return p;
   }
   for (const p of players) {
     if ((p.name || "").toLowerCase() === nLow) return p;
